@@ -383,7 +383,97 @@ fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
         now,
         &mut out,
     );
+    out.extend(account_facts(v));
     out
+}
+
+/// What the usage reply says beside its windows (seen live on a Plus account, 2026-10-08): the bought
+/// credit balance, saved rate-limit resets (banked since 2026-06-11), and models that are switched off
+/// until a time. Text rows on the card, after the bars; never a ring.
+fn account_facts(v: &serde_json::Value) -> Vec<LimitWindow> {
+    let mut out = Vec::new();
+    let fact = |id: String, label: String, info: String, resets_at: Option<u64>| LimitWindow {
+        id,
+        label,
+        info: Some(info),
+        resets_at,
+        ..Default::default()
+    };
+    if let Some(c) = v.get("credits").filter(|x| x.is_object()) {
+        let unlimited = c.get("unlimited").and_then(|x| x.as_bool()) == Some(true);
+        let balance = c
+            .get("balance")
+            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.trim().parse().ok())))
+            .filter(|b: &f64| b.is_finite());
+        let has = c.get("has_credits").and_then(|x| x.as_bool()) == Some(true);
+        let capped = c.get("overage_limit_reached").and_then(|x| x.as_bool()) == Some(true);
+        let text = if unlimited {
+            Some("Unlimited".to_string())
+        } else {
+            match balance {
+                Some(b) if has || b > 0.0 => Some(format!("{} left", trim_number(b))),
+                _ => None,
+            }
+        };
+        if let Some(mut text) = text {
+            if capped {
+                text.push_str(" · overage cap reached");
+            }
+            out.push(fact("credits".into(), "Credits".into(), text, None));
+        }
+    }
+    if let Some(r) = v.get("rate_limit_reset_credits").filter(|x| x.is_object()) {
+        let n = r.get("available_count").and_then(|x| x.as_u64()).unwrap_or(0);
+        if n > 0 {
+            let usable = r.get("applicable_available_count").and_then(|x| x.as_u64());
+            let text = match usable {
+                Some(u) if u < n => format!("{n} saved · {u} usable now"),
+                _ => format!("{n} saved"),
+            };
+            out.push(fact("reset-credits".into(), "Limit resets".into(), text, None));
+        }
+    }
+    if let Some(models) = v.get("model_usage").and_then(|x| x.as_object()) {
+        let mut names: Vec<&String> = models.keys().collect();
+        names.sort();
+        for name in names {
+            let m = &models[name];
+            if m.get("available").and_then(|x| x.as_bool()) != Some(false) {
+                continue;
+            }
+            let at = m.get("available_at").and_then(|x| {
+                x.as_f64()
+                    .and_then(secs_to_ms)
+                    .or_else(|| x.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_millis().max(0) as u64))
+            });
+            let mut text = "Unavailable".to_string();
+            if m.get("credits_would_enable").and_then(|x| x.as_bool()) == Some(true) {
+                text.push_str(" · credits would enable it");
+            }
+            out.push(fact(format!("model-{name}"), model_name(name), text, at));
+        }
+    }
+    out
+}
+
+fn trim_number(x: f64) -> String {
+    if x.fract() == 0.0 { format!("{}", x as i64) } else { format!("{x:.2}") }
+}
+
+/// "gpt-6-astra" → "GPT-6 Astra", the way OpenAI's own pricing page names it
+fn model_name(id: &str) -> String {
+    let parts: Vec<&str> = id.split('-').filter(|p| !p.is_empty()).collect();
+    let cap = |p: &str| {
+        let mut c = p.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    };
+    match parts.as_slice() {
+        ["gpt", ver, rest @ ..] => {
+            let head = format!("GPT-{ver}");
+            std::iter::once(head).chain(rest.iter().map(|p| cap(p))).collect::<Vec<_>>().join(" ")
+        }
+        _ => parts.iter().map(|p| cap(p)).collect::<Vec<_>>().join(" "),
+    }
 }
 
 // ---------------- Fallback: the rollout snapshot ----------------
@@ -964,9 +1054,10 @@ mod tests {
             "credits":{"balance":"100"},"model_usage":{"spark":99}
         }"#,
         );
-        assert_eq!(ids(&ws), ["primary", "secondary", "spark", "code-review"]);
-        assert_eq!(labels(&ws), ["5h limit", "Weekly limit", "5h limit", "Weekly limit"]);
-        assert_eq!(groups(&ws), [None, None, Some("Spark"), Some("Code review")]);
+        assert_eq!(ids(&ws), ["primary", "secondary", "spark", "code-review", "credits"]);
+        assert_eq!(labels(&ws), ["5h limit", "Weekly limit", "5h limit", "Weekly limit", "Credits"]);
+        assert_eq!(groups(&ws), [None, None, Some("Spark"), Some("Code review"), None]);
+        assert_eq!(ws[4].info.as_deref(), Some("100 left"));
         assert!((ws[0].used - 0.25).abs() < 1e-9);
         assert!((ws[2].used - 0.99).abs() < 1e-9);
         assert!((ws[3].used - 0.90).abs() < 1e-9);
@@ -1009,6 +1100,30 @@ mod tests {
         assert_eq!(labels(&ws), ["5h limit", "Weekly limit"]);
         assert!((ws[0].used - 0.40).abs() < 1e-9);
         assert!((ws[1].used - 0.70).abs() < 1e-9);
+    }
+
+    /// The Plus reply of 2026-10-08, trimmed: no credits bought, three saved resets of which none apply
+    /// yet, and one model switched off
+    #[test]
+    fn account_facts_follow_the_windows_as_text_rows() {
+        let ws = windows(
+            r#"{
+            "rate_limit":{"allowed":true,"limit_reached":false,
+              "primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1800001000},
+              "secondary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_at":1800600000}},
+            "code_review_rate_limit":null,"additional_rate_limits":null,
+            "model_usage":{"gpt-6-astra":{"available":false,"available_at":1800002000,"credits_would_enable":true},
+                           "gpt-6-luna":{"available":true}},
+            "credits":{"has_credits":false,"unlimited":false,"overage_limit_reached":false,"balance":"0"},
+            "rate_limit_reset_credits":{"available_count":3,"applicable_available_count":0}
+        }"#,
+        );
+        assert_eq!(ids(&ws), ["primary", "secondary", "reset-credits", "model-gpt-6-astra"]);
+        assert_eq!(ws[2].info.as_deref(), Some("3 saved · 0 usable now"));
+        assert_eq!(ws[3].label, "GPT-6 Astra");
+        assert_eq!(ws[3].info.as_deref(), Some("Unavailable · credits would enable it"));
+        assert_eq!(ws[3].resets_at, Some(1_800_002_000_000));
+        assert!(ws[2..].iter().all(|w| !w.is_meter()));
     }
 
     #[test]

@@ -74,8 +74,9 @@ impl ResetWatcher {
         let mut seen = HashSet::new();
         for window in &snapshot.windows {
             // A named group (Codex's Spark/Code review) is a sub-limit, not the account's own quota;
-            // a pure count window (Antigravity's requests today) has no fraction to have renewed.
-            if window.group.is_some() || window.count.is_some() {
+            // a pure count window (Antigravity's requests today), a money balance or a text row has no
+            // fraction of a plan to have renewed.
+            if window.group.is_some() || !window.is_meter() {
                 continue;
             }
             if !window.used.is_finite() || !(0.0..=1.0).contains(&window.used) || !seen.insert(window.id.clone())

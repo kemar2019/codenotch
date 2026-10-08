@@ -393,6 +393,12 @@ function usedCopy(w){
   return ui().usedLeft(used,left);
 }
 
+// "$2.97 of $200.00 · $197.03 left", as money_text in traymenu.rs words the first half
+function moneyCopy(m){
+  const sym={USD:'$',EUR:'€',GBP:'£'}[m.currency];
+  const amt=x=>sym?sym+x.toFixed(2):x.toFixed(2)+' '+m.currency;
+  return `${amt(m.spent)} ${textCopy('of')} ${amt(m.limit)} · ${amt(Math.max(0,m.limit-m.spent))} ${textCopy('left')}`;
+}
 let usage={status:'',windows:[],fetched_at:0,note:''};
 let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
@@ -1143,9 +1149,11 @@ let agPrefs={limit:'automatic',model:'gemini'};
 // Where the weekly limit's own ring goes, from settings: 'off', 'inside' or 'outside'
 let weeklyRing='off';
 let weeklyRingDashed=false;
+// A share of a plan; a count, a balance or a text row never heads a ring
+const isMeter=w=>w.count==null&&w.money==null&&w.info==null;
 // The tightest metered window, ties going to the lower id so the choice never flickers
 function tightestOf(ws){
-  return ws.filter(w=>w.count==null).reduce((a,b)=>!a||b.used>a.used||(b.used===a.used&&b.id<a.id)?b:a,null);
+  return ws.filter(isMeter).reduce((a,b)=>!a||b.used>a.used||(b.used===a.used&&b.id<a.id)?b:a,null);
 }
 function laneFamily(w){ const id=w.id.toLowerCase(); return id.startsWith('gemini')?'gemini':(id.startsWith('3p')||id.startsWith('claude'))?'3p':''; }
 function laneIs(w,limit){
@@ -1173,7 +1181,7 @@ function headlineOf(snap,id){
 // Codex calls its second window secondary, and Antigravity has one per model family. Cursor has none.
 // BEGIN TESTABLE WEEKLY SELECTOR
 function weeklyOf(snap,id){
-  const ws=snap.windows.filter(w=>w.count==null); if(!ws.length) return null;
+  const ws=snap.windows.filter(w=>w.count==null&&w.money==null&&w.info==null); if(!ws.length) return null;
   const byId=x=>ws.find(w=>w.id===x)||null;
   if(id==='claude') return byId('seven_day')||byId('weekly_all')||byId('weekly');
   if(id==='codex') return byId('secondary');
@@ -1346,6 +1354,20 @@ function renderCard(){
         if(group) html+=`</div>`;
         group=w.group||null;
         if(group) html+=`<div class="g-head">${esc(textCopy(group))}</div><div class="g-box">`;
+      }
+      if(w.info!=null){ // a fact, not a share of anything: no bar
+        html+=`<div class="win"><div class="w-row"><span class="w-label">${esc(textCopy(w.label))}</span><span class="w-reset">${resetCopy(w.resets_at)}</span></div>
+          <div class="w-used">${esc(textCopy(w.info))}</div></div>`;
+        continue;
+      }
+      if(w.money!=null){ // a balance: the bar is spent of limit, the line says how much, and a date on it is an expiry
+        const exp=w.resets_at?`${esc(textCopy('Expires'))} ${new Date(w.resets_at).toLocaleDateString(ui().locale,{month:'short',day:'numeric'})}`:'';
+        html+=`<div class="win">
+          <div class="w-row"><span class="w-label">${esc(textCopy(w.label))}</span><span class="w-reset">${exp}</span></div>
+          <div class="w-track"><div class="w-fill" style="width:${(Math.min(w.used,1)*100).toFixed(0)}%;background:${tone(w.used)}"></div></div>
+          <div class="w-used">${esc(moneyCopy(w.money))}</div>
+        </div>`;
+        continue;
       }
       if(w.count!=null){
         html+=`<div class="win"><div class="w-row"><span class="w-label">${esc(textCopy(w.label))}</span></div>

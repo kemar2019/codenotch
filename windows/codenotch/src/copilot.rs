@@ -315,9 +315,42 @@ pub fn label(id: &str) -> String {
     }
 }
 
-/// The plan name, for the card's account line
+/// The plan name, for the card's account line. `access_type_sku` first: a Free account still says
+/// `copilot_plan: "individual"`, which reads as a paid plan
 pub fn plan(v: &serde_json::Value) -> Option<String> {
-    non_empty(v.get("copilot_plan").or_else(|| v.get("plan")).and_then(|x| x.as_str()).map(|s| s.to_string()))
+    let sku = v.get("access_type_sku").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
+    let named = if sku.starts_with("free") {
+        Some("Free")
+    } else if sku.contains("pro_plus") || sku.contains("pro+") {
+        Some("Pro+")
+    } else if sku.contains("max") {
+        Some("Max")
+    } else if sku.contains("enterprise") {
+        Some("Enterprise")
+    } else if sku.contains("business") {
+        Some("Business")
+    } else if sku.contains("pro") {
+        Some("Pro")
+    } else {
+        None
+    };
+    named
+        .map(String::from)
+        .or_else(|| non_empty(v.get("copilot_plan").or_else(|| v.get("plan")).and_then(|x| x.as_str()).map(|s| s.to_string())))
+}
+
+/// Since 2026-06-01 Copilot meters in AI Credits ($0.01 each, per token) rather than premium
+/// requests; the reply flags it with `token_based_billing`, on the root or on the quota
+fn token_billed(quota: &serde_json::Value, root: &serde_json::Value) -> bool {
+    [quota, root].iter().any(|x| x.get("token_based_billing").and_then(|b| b.as_bool()) == Some(true))
+}
+
+fn quota_label(id: &str, quota: &serde_json::Value, root: &serde_json::Value) -> String {
+    if id == "premium_interactions" && token_billed(quota, root) {
+        "AI Credits".into()
+    } else {
+        label(id)
+    }
 }
 
 fn window(id: &str, quota: &serde_json::Value, root: &serde_json::Value) -> Option<LimitWindow> {
@@ -333,10 +366,11 @@ fn window(id: &str, quota: &serde_json::Value, root: &serde_json::Value) -> Opti
     let resets_at = date_ms(quota.get("reset_date"))
         .or_else(|| date_ms(quota.get("reset_at")))
         .or_else(|| date_ms(quota.get("resets_at")))
+        .or_else(|| date_ms(root.get("quota_reset_date_utc")))
         .or_else(|| date_ms(root.get("quota_reset_date")));
     Some(LimitWindow {
         id: id.to_string(),
-        label: label(id),
+        label: quota_label(id, quota, root),
         used: (consumed / entitlement).clamp(0.0, 1.0),
         resets_at,
         ..Default::default()
@@ -352,7 +386,30 @@ pub fn parse(v: &serde_json::Value) -> (Vec<LimitWindow>, String) {
     let mut rest: Vec<&str> = quotas.keys().map(|k| k.as_str()).filter(|k| !ORDER.contains(k)).collect();
     rest.sort_unstable();
     keys.append(&mut rest);
-    let out: Vec<LimitWindow> = keys.iter().filter_map(|k| window(k, &quotas[*k], v)).collect();
+    let mut out: Vec<LimitWindow> = keys.iter().filter_map(|k| window(k, &quotas[*k], v)).collect();
+    // Text rows after the bars, under ids of their own so the ring never takes one for its headline
+    if let Some(p) = quotas.get("premium_interactions") {
+        let unlimited = p.get("unlimited").and_then(|x| x.as_bool()) == Some(true);
+        let entitlement = number(p.get("entitlement")).unwrap_or(0.0);
+        // A Free account's allowance is 0 and was dropped as "not a limit"; it is a limit of nothing
+        if !unlimited && entitlement <= 0.0 && p.get("has_quota").and_then(|x| x.as_bool()) == Some(false) {
+            out.push(LimitWindow {
+                id: "premium_interactions_none".into(),
+                label: quota_label("premium_interactions", p, v),
+                info: Some("None included on this plan".into()),
+                ..Default::default()
+            });
+        }
+        let over = number(p.get("overage_count")).unwrap_or(0.0);
+        if over > 0.0 {
+            out.push(LimitWindow {
+                id: "premium_overage".into(),
+                label: "Over the allowance".into(),
+                info: Some(format!("{}", over.round() as i64)),
+                ..Default::default()
+            });
+        }
+    }
     if out.is_empty() {
         return (out, "GitHub Copilot reported no metered quotas".into());
     }
@@ -528,12 +585,51 @@ mod tests {
         .unwrap();
         let (w, note) = parse(&v);
         assert!(note.is_empty());
-        assert_eq!(w.len(), 1, "unlimited chat and completions draw nothing");
+        assert_eq!(w.len(), 2, "unlimited chat and completions draw nothing");
         assert_eq!(w[0].id, "premium_interactions");
+        assert_eq!(w[1].id, "premium_overage");
+        assert_eq!(w[1].info.as_deref(), Some("4321"));
         assert_eq!(w[0].used, 1.0, "over the allowance is full, not 121 %");
         assert_eq!(w[0].resets_at, Some(1_790_812_800_000), "the bare date is midnight UTC on 1 October 2026");
         assert_eq!(plan(&v).as_deref(), Some("business"));
         assert_eq!(date_ms(Some(&serde_json::json!(0))), None, "a zero reset is unstated, not 1970");
+    }
+
+    /// A Free account's reply of 2026-10-08 under token billing (ids and counts trimmed)
+    #[test]
+    fn a_free_account_under_token_billing() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"copilot_plan":"individual","access_type_sku":"free_limited_copilot","token_based_billing":true,
+              "quota_reset_date":"2026-11-01","quota_reset_date_utc":"2026-11-01T00:00:00.000Z",
+              "quota_snapshots":{
+                "chat":{"entitlement":200,"remaining":200,"has_quota":true,"unlimited":false,"quota_reset_at":0},
+                "completions":{"entitlement":2000,"remaining":1990,"has_quota":true,"unlimited":false},
+                "premium_interactions":{"entitlement":0,"remaining":0,"has_quota":false,"unlimited":false,
+                  "overage_permitted":false,"overage_count":0,"token_based_billing":true}}}"#,
+        )
+        .unwrap();
+        let (w, _) = parse(&v);
+        assert_eq!(
+            w.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+            ["chat", "completions", "premium_interactions_none"]
+        );
+        assert_eq!(w[2].label, "AI Credits");
+        assert_eq!(w[2].info.as_deref(), Some("None included on this plan"));
+        assert_eq!(w[0].resets_at, Some(1_793_491_200_000), "midnight UTC on 1 November 2026");
+        assert_eq!(plan(&v).as_deref(), Some("Free"));
+    }
+
+    #[test]
+    fn a_paid_token_billed_seat_calls_its_premium_quota_ai_credits() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"access_type_sku":"copilot_pro","token_based_billing":true,
+              "quota_snapshots":{"premium_interactions":{"entitlement":1000,"remaining":750}}}"#,
+        )
+        .unwrap();
+        let (w, _) = parse(&v);
+        assert_eq!(w[0].label, "AI Credits");
+        assert!((w[0].used - 0.25).abs() < 1e-9);
+        assert_eq!(plan(&v).as_deref(), Some("Pro"));
     }
 
     #[test]

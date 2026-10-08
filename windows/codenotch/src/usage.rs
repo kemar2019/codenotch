@@ -17,7 +17,9 @@
 //!     desktop app renews its own copy elsewhere — so without this the file rots eight hours after the last CLI run
 //!   - never invent a percentage on failure: keep the last reading marked stale, and the UI shows how old it is
 //!
-//! Reply (snake_case): { limits:[{kind,percent,resets_at}], five_hour:{utilization,resets_at}, seven_day:{...} }
+//! Reply (snake_case): { limits:[{kind,percent,resets_at,scope}], five_hour:{utilization,resets_at}, seven_day:{...} }
+//! A model with its own weekly allowance (Fable, as of 2026-10) arrives as kind=weekly_scoped with
+//! scope.model.display_name naming the model; it becomes window "weekly_scoped:fable", "Weekly (Fable)".
 //! limits is the forward-compatible main shape; five_hour/seven_day are merged in as a fallback (a window that just rolled over disappears from limits).
 
 use crate::AppState;
@@ -144,6 +146,29 @@ pub struct LimitWindow {
     /// for several things (Antigravity: a 5-hour and a weekly lane per model family). None = ungrouped
     #[serde(default)]
     pub group: Option<String>,
+    /// A balance in money rather than a share of a plan (Claude's usage credits): the card reads
+    /// "$X of $Y" with `used` as the bar. Never a ring, never a reset card
+    #[serde(default)]
+    pub money: Option<Money>,
+    /// A fact with no bar (Codex's credit balance, saved resets): the card prints it as the row's
+    /// value. Never a ring, never a reset card
+    #[serde(default)]
+    pub info: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Money {
+    /// ISO 4217, "USD"
+    pub currency: String,
+    pub spent: f64,
+    pub limit: f64,
+}
+
+impl LimitWindow {
+    /// A metered share of a plan, the only kind a ring or a reset card may draw from
+    pub fn is_meter(&self) -> bool {
+        self.count.is_none() && self.money.is_none() && self.info.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -428,6 +453,34 @@ fn label_for(kind: &str) -> String {
     }
 }
 
+/// What a limit is scoped to, by name: `scope.model.display_name` ("Fable" for the model that has its
+/// own weekly allowance), else the surface. None for an unscoped limit or a scope that names nothing.
+fn scope_name(l: &serde_json::Value) -> Option<String> {
+    let scope = l.get("scope")?;
+    let named = |x: &serde_json::Value| -> Option<String> {
+        x.as_str()
+            .or_else(|| x.get("display_name").and_then(|d| d.as_str()))
+            .or_else(|| x.get("id").and_then(|d| d.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    scope.get("model").and_then(named).or_else(|| scope.get("surface").and_then(named))
+}
+
+/// A scoped limit takes its scope into both id and label, so two models each with their own weekly
+/// allowance stay two windows ("weekly_scoped:fable" → "Weekly (Fable)") instead of one id twice.
+fn id_and_label(kind: &str, scope: Option<&str>) -> (String, String) {
+    let Some(name) = scope else { return (kind.to_string(), label_for(kind)) };
+    let slug = name.to_ascii_lowercase().replace(' ', "_");
+    let label = if kind.starts_with("weekly") || kind.starts_with("seven_day") {
+        format!("Weekly ({name})")
+    } else {
+        format!("{} ({name})", label_for(kind))
+    };
+    (format!("{kind}:{slug}"), label)
+}
+
 fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
     let mut out: Vec<LimitWindow> = Vec::new();
     if let Some(arr) = v.get("limits").and_then(|x| x.as_array()) {
@@ -442,9 +495,10 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
             if resets.is_none() {
                 continue; // upstream rule: a window without a reset time is not shown
             }
+            let (id, label) = id_and_label(kind, scope_name(l).as_deref());
             out.push(LimitWindow {
-                id: kind.to_string(),
-                label: label_for(kind),
+                id,
+                label,
                 used: (pct / 100.0).clamp(0.0, 1.0),
                 resets_at: resets, ..Default::default()
             });
@@ -476,9 +530,65 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
         }
         out.push(LimitWindow { id: id.into(), label, used, resets_at, ..Default::default() });
     }
-    // session always comes first (upstream display order)
+    // session always comes first (upstream display order), balances last
     out.sort_by_key(|w| if w.id == "session" { 0 } else { 1 });
+    out.extend(spend_window(v));
+    out.extend(cloud_credit_window(v));
     out
+}
+
+/// Usage credits (pay-as-you-go past the plan, formerly "extra usage"), as the Mac's spendWindow reads
+/// them: only on a seat that has them switched on and a limit set, and the share from the two amounts
+/// rather than `percent`, which is rounded to a whole percent. No reset: the block carries none.
+fn spend_window(v: &serde_json::Value) -> Option<LimitWindow> {
+    let spend = v.get("spend")?;
+    if spend.get("enabled").and_then(|x| x.as_bool()) == Some(false) {
+        return None;
+    }
+    let amount = |key: &str| -> Option<(f64, Option<String>)> {
+        let a = spend.get(key)?;
+        let minor = a.get("amount_minor")?.as_f64()?;
+        let exp = a.get("exponent").and_then(|x| x.as_i64()).unwrap_or(2) as i32;
+        Some((minor / 10f64.powi(exp), a.get("currency").and_then(|x| x.as_str()).map(String::from)))
+    };
+    let (used, used_cur) = amount("used")?;
+    let (limit, limit_cur) = amount("limit")?;
+    if limit <= 0.0 {
+        return None;
+    }
+    Some(LimitWindow {
+        id: "spend".into(),
+        label: "Usage credits".into(),
+        used: (used / limit).clamp(0.0, 1.0),
+        money: Some(Money { currency: limit_cur.or(used_cur).unwrap_or_else(|| "USD".into()), spent: used, limit }),
+        ..Default::default()
+    })
+}
+
+/// The one-time Claude Code cloud-session credit ($100 Pro / $250 Max, granted 2026-09-23, expiring
+/// 2026-11-04 23:59 PT). The endpoint carries it under the codename `iguana_necktie`; the match is by
+/// amount and expiry, which Anthropic has not documented, so it is read only when it names a dollar
+/// limit, and `resets_at` here is when it expires, not when it renews.
+fn cloud_credit_window(v: &serde_json::Value) -> Option<LimitWindow> {
+    let c = v.get("iguana_necktie")?;
+    let limit = c.get("limit_dollars")?.as_f64()?;
+    if limit <= 0.0 {
+        return None;
+    }
+    let spent = c
+        .get("used_dollars")
+        .and_then(|x| x.as_f64())
+        .or_else(|| c.get("remaining_dollars").and_then(|x| x.as_f64()).map(|r| limit - r))
+        .unwrap_or(0.0)
+        .max(0.0);
+    Some(LimitWindow {
+        id: "cloud_credit".into(),
+        label: "Cloud session credit".into(),
+        used: (spent / limit).clamp(0.0, 1.0),
+        resets_at: c.get("resets_at").and_then(parse_reset),
+        money: Some(Money { currency: "USD".into(), spent, limit }),
+        ..Default::default()
+    })
 }
 
 enum FetchErr {
@@ -751,6 +861,72 @@ pub fn start(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape the endpoint returned on 2026-10-08 for a Max account, trimmed to what is parsed
+    #[test]
+    fn a_model_scoped_weekly_limit_is_named_after_its_model() {
+        let v: serde_json::Value = serde_json::from_str(r#"{
+            "five_hour": {"utilization": 0.0, "resets_at": "2026-10-08T22:09:59.607414+00:00"},
+            "seven_day": {"utilization": 74.0, "resets_at": "2026-10-10T17:59:59.607445+00:00"},
+            "limits": [
+                {"kind": "session", "percent": 0, "resets_at": "2026-10-08T22:09:59.607414+00:00", "scope": null},
+                {"kind": "weekly_all", "percent": 74, "resets_at": "2026-10-10T17:59:59.607445+00:00", "scope": null},
+                {"kind": "weekly_scoped", "percent": 12, "resets_at": "2026-10-10T18:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}},
+                {"kind": "weekly_scoped", "percent": 5, "resets_at": "2026-10-10T18:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Opus"}, "surface": null}}
+            ]
+        }"#).unwrap();
+        let ws = parse_response(&v);
+        let ids: Vec<&str> = ws.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["session", "weekly_all", "weekly_scoped:fable", "weekly_scoped:opus"]);
+        let fable = &ws[2];
+        assert_eq!(fable.label, "Weekly (Fable)");
+        assert!((fable.used - 0.12).abs() < 1e-9);
+        assert_eq!(ws[3].label, "Weekly (Opus)");
+    }
+
+    #[test]
+    fn balances_are_money_rows_after_the_plan_windows() {
+        let v: serde_json::Value = serde_json::from_str(r#"{
+            "limits": [{"kind": "session", "percent": 4, "resets_at": "2026-10-08T22:09:59Z"}],
+            "iguana_necktie": {"utilization": 0.0, "resets_at": "2026-11-05T07:59:00+00:00",
+                "limit_dollars": 250, "used_dollars": 40.0, "remaining_dollars": 210.0},
+            "spend": {"enabled": true, "used": {"amount_minor": 297, "currency": "USD", "exponent": 2},
+                "limit": {"amount_minor": 20000, "currency": "USD", "exponent": 2}, "percent": 1}
+        }"#).unwrap();
+        let ws = parse_response(&v);
+        let ids: Vec<&str> = ws.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["session", "spend", "cloud_credit"]);
+        let spend = &ws[1];
+        assert_eq!(spend.money, Some(Money { currency: "USD".into(), spent: 2.97, limit: 200.0 }));
+        assert!((spend.used - 0.01485).abs() < 1e-9, "from the amounts, not the rounded percent");
+        assert!(!spend.is_meter());
+        assert!((ws[2].used - 0.16).abs() < 1e-9);
+        assert!(ws[2].resets_at.is_some());
+    }
+
+    /// The live 2026-10-08 shape: credits switched off and the codename null draw nothing
+    #[test]
+    fn switched_off_or_absent_balances_draw_nothing() {
+        let v: serde_json::Value = serde_json::from_str(r#"{
+            "limits": [{"kind": "session", "percent": 0, "resets_at": "2026-10-08T22:09:59Z"}],
+            "iguana_necktie": null,
+            "spend": {"enabled": false, "used": {"amount_minor": 0, "currency": "USD", "exponent": 2}, "limit": null}
+        }"#).unwrap();
+        assert_eq!(parse_response(&v).len(), 1);
+    }
+
+    #[test]
+    fn a_scope_that_names_nothing_keeps_the_generic_label() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"limits": [
+            {"kind": "weekly_scoped", "percent": 3, "resets_at": "2026-10-10T18:00:00+00:00",
+             "scope": {"model": {"id": null, "display_name": null}, "surface": null}}
+        ]}"#).unwrap();
+        let ws = parse_response(&v);
+        assert_eq!(ws[0].id, "weekly_scoped");
+        assert_eq!(ws[0].label, "Weekly (model-scoped)");
+    }
 
     const EXP: u64 = 1_000_000_000;
 

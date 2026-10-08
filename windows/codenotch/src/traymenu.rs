@@ -33,6 +33,17 @@ pub fn pct(fraction: f64) -> String {
     }
 }
 
+/// "$2.97 of $200.00": a balance in its own currency, the symbol only where it cannot be mistaken
+pub fn money_text(m: &crate::usage::Money) -> String {
+    let amount = |x: f64| match m.currency.as_str() {
+        "USD" => format!("${x:.2}"),
+        "EUR" => format!("€{x:.2}"),
+        "GBP" => format!("£{x:.2}"),
+        other => format!("{x:.2} {other}"),
+    };
+    format!("{} of {}", amount(m.spent), amount(m.limit))
+}
+
 /// "61% Used · 39% left". Both ends, because vendors disagree about which one they publish, and the
 /// left half is taken from the rounded used half so the two always add up on screen.
 pub fn used_left(w: &LimitWindow, lang: &str) -> String {
@@ -256,6 +267,16 @@ pub fn label(name: &str, lang: &str) -> String {
         ("ko", "Completions") => "코드 완성",
         _ => name,
     };
+    // A model with its own weekly allowance ("Weekly (Fable)") is worded the way Opus's is, with the
+    // model's name in place of Opus, so a model nobody has listed yet still reads in the menu's language.
+    if translated == name && name != "Weekly (Opus)" {
+        if let Some(model) = name.strip_prefix("Weekly (").and_then(|s| s.strip_suffix(')')) {
+            let opus = label("Weekly (Opus)", lang);
+            if opus != "Weekly (Opus)" {
+                return opus.replace("Opus", model);
+            }
+        }
+    }
     translated.into()
 }
 
@@ -280,7 +301,13 @@ pub fn window_line(w: &LimitWindow, now: u64, lang: &str) -> String {
     if let Some(count) = w.count {
         return format!("{name}: ~{count}");
     }
-    let mut line = format!("{name}: {}", used_left(w, lang));
+    if let Some(info) = &w.info {
+        return format!("{name}: {info}");
+    }
+    let mut line = match &w.money {
+        Some(m) => format!("{name}: {}", money_text(m)),
+        None => format!("{name}: {}", used_left(w, lang)),
+    };
     if let Some(at) = w.resets_at {
         line.push_str(" · ");
         line.push_str(&reset_text(at, now, lang));
@@ -394,6 +421,9 @@ mod tests {
             "Sessão atual: 61% usado · 39% restante · Renova em 59 min"
         );
         assert_eq!(label("Weekly limit", "pt-BR"), "Limite semanal");
+        assert_eq!(label("Weekly (Fable)", "pt-BR"), "Semanal (Fable)");
+        assert_eq!(label("Weekly (Fable)", "zh"), "每周（Fable）");
+        assert_eq!(label("Weekly (Fable)", "en"), "Weekly (Fable)");
         assert_eq!(label("Monthly limit", "pt-BR"), "Limite mensal");
         assert_eq!(label("Included usage", "pt-BR"), "Uso incluído");
         assert_eq!(label("API usage", "pt-BR"), "Uso da API");
